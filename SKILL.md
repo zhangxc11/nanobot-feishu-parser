@@ -94,6 +94,14 @@ python3 skills/feishu-parser/scripts/feishu_parser.py download-media --message-i
 
 自动从 `~/.nanobot/config.json` 读取飞书应用凭证（appId/appSecret），与 feishu-docs skill 共享同一配置。
 
+## 权限要求
+
+飞书应用需开通以下权限：
+- `im:message` — 获取与发送单聊、群组消息
+- `im:message:readonly` — 读取消息
+- `im:message.group_msg` — 获取群组消息
+- `im:message.p2p_msg:readonly` — 读取用户发给机器人的单聊消息
+
 ## 依赖
 
 - `lark-oapi` (已安装)
