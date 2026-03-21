@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """飞书消息解析 CLI — nanobot feishu-parser skill
 
-解析飞书消息内容，支持获取单条消息详情、解析合并转发消息、下载媒体文件。
+解析飞书消息内容，支持获取单条消息详情、解析合并转发消息、下载媒体文件、语音转文字。
 带 dump 功能，方便调试和迭代。
 
 用法:
@@ -9,15 +9,22 @@
   python3 feishu_parser.py parse-forward --message-id om_xxx [--app lab] [--dump] [--download]
   python3 feishu_parser.py parse-forward --content-json '{"message_id_list":[...]}' [--app lab] [--dump] [--download]
   python3 feishu_parser.py download-media --message-id om_xxx --type image --key img_xxx [--app lab]
+  python3 feishu_parser.py transcribe <audio_file> [--app lab] [--engine auto|feishu|local] [--language zh-CN]
 
 安全说明:
   - appSecret 仅在此脚本进程内使用，不输出到 stdout
 """
 
 import argparse
+import base64
 import json
 import os
+import subprocess
 import sys
+import tempfile
+import threading
+import time
+import uuid
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -310,6 +317,317 @@ def save_media_file(data: bytes, filename: str, subdir: Optional[str] = None) ->
     return str(file_path)
 
 
+# ── Audio transcription (ASR) ────────────────────────────────────────
+
+def convert_audio_to_wav(input_path: str, sample_rate: int = None) -> str:
+    """Convert audio file to WAV format using macOS afconvert.
+
+    Args:
+        input_path: Path to input audio file (opus, m4a, etc.)
+        sample_rate: Target sample rate (e.g. 16000). None = keep original.
+
+    Returns:
+        Path to temporary WAV file. Caller is responsible for cleanup.
+
+    Raises:
+        RuntimeError: If conversion fails.
+    """
+    # Create temp file for output
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav")
+    os.close(tmp_fd)
+
+    cmd = ["afconvert", input_path, tmp_path, "-d", "LEI16", "-f", "WAVE"]
+    if sample_rate:
+        # Override the data format spec with sample rate
+        cmd = ["afconvert", input_path, tmp_path,
+               "-d", f"LEI16@{sample_rate}", "-f", "WAVE", "-c", "1"]
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            # Clean up temp file on failure
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"afconvert failed (exit {result.returncode}): {result.stderr.strip()}"
+            )
+        return tmp_path
+    except subprocess.TimeoutExpired:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise RuntimeError("afconvert timed out (>30s)")
+    except FileNotFoundError:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise RuntimeError("afconvert not found — this command requires macOS")
+
+
+def transcribe_feishu(audio_path: str, app_name: str, language: str) -> Optional[str]:
+    """Transcribe audio using Feishu ASR API.
+
+    Converts audio to PCM 16kHz mono, then calls the Feishu speech-to-text API.
+
+    Args:
+        audio_path: Path to audio file.
+        app_name: Feishu app name for credentials.
+        language: Language code (e.g. 'zh-CN').
+
+    Returns:
+        Recognized text, or None on failure.
+    """
+    import requests
+
+    wav_path = None
+    try:
+        # Convert to WAV 16kHz mono
+        wav_path = convert_audio_to_wav(audio_path, sample_rate=16000)
+
+        # Read WAV and skip 44-byte header to get raw PCM data
+        with open(wav_path, "rb") as f:
+            wav_data = f.read()
+
+        # Standard WAV header is 44 bytes; find "data" chunk for robustness
+        pcm_data = _extract_pcm_from_wav(wav_data)
+        if not pcm_data:
+            print("WARNING: [feishu-asr] Failed to extract PCM data from WAV", file=sys.stderr)
+            return None
+
+        # Base64 encode
+        speech_b64 = base64.standard_b64encode(pcm_data).decode("ascii")
+
+        # Get tenant token
+        token = get_tenant_token(app_name)
+
+        # Call Feishu ASR file_recognize API (for audio ≤60s)
+        resp = requests.post(
+            "https://open.feishu.cn/open-apis/speech_to_text/v1/speech/file_recognize",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            json={
+                "speech": {
+                    "speech": speech_b64,
+                },
+                "config": {
+                    "engine_type": "16k_auto",
+                    "format": "pcm",
+                    "file_id": uuid.uuid4().hex[:16],
+                },
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data.get("code") != 0:
+            print(f"WARNING: [feishu-asr] API error: code={data.get('code')}, "
+                  f"msg={data.get('msg')}", file=sys.stderr)
+            return None
+
+        recognition_text = data.get("data", {}).get("recognition_text", "")
+        return recognition_text
+
+    except requests.RequestException as e:
+        print(f"WARNING: [feishu-asr] Request failed: {e}", file=sys.stderr)
+        return None
+    except SystemExit:
+        # get_tenant_token / load_feishu_credentials may sys.exit on bad config;
+        # catch here so auto-mode can still fall back to local ASR.
+        print("WARNING: [feishu-asr] Feishu credential/token error (SystemExit caught)", file=sys.stderr)
+        return None
+    except RuntimeError as e:
+        print(f"WARNING: [feishu-asr] Audio conversion failed: {e}", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"WARNING: [feishu-asr] Unexpected error: {e}", file=sys.stderr)
+        return None
+    finally:
+        if wav_path:
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
+
+
+def _extract_pcm_from_wav(wav_data: bytes) -> Optional[bytes]:
+    """Extract raw PCM data from WAV file bytes.
+
+    Searches for the 'data' chunk and returns its contents.
+    Falls back to skipping 44-byte header if chunk not found.
+    """
+    # Try to find "data" chunk marker
+    idx = wav_data.find(b"data")
+    if idx >= 0 and idx + 8 <= len(wav_data):
+        # 4 bytes "data" + 4 bytes little-endian chunk size
+        chunk_size = int.from_bytes(wav_data[idx + 4:idx + 8], byteorder="little")
+        pcm_start = idx + 8
+        if chunk_size > 0 and pcm_start + chunk_size <= len(wav_data):
+            return wav_data[pcm_start:pcm_start + chunk_size]
+        # If chunk_size seems wrong, return everything after header
+        return wav_data[pcm_start:]
+
+    # Fallback: skip standard 44-byte WAV header
+    if len(wav_data) > 44:
+        return wav_data[44:]
+
+    return None
+
+
+def _ensure_speech_authorization() -> bool:
+    """Request and wait for SFSpeechRecognizer authorization.
+
+    Returns True if authorized, False otherwise.
+    """
+    import Speech
+
+    status = Speech.SFSpeechRecognizer.authorizationStatus()
+    # 3 = authorized
+    if status == 3:
+        return True
+    # 1 = denied, 2 = restricted
+    if status in (1, 2):
+        status_names = {1: "denied", 2: "restricted"}
+        print(f"WARNING: [local-asr] Speech recognition authorization: {status_names[status]}. "
+              f"Grant access in System Settings > Privacy & Security > Speech Recognition.",
+              file=sys.stderr)
+        return False
+
+    # 0 = notDetermined — request authorization
+    auth_event = threading.Event()
+    auth_result = [False]
+
+    def auth_handler(granted):
+        auth_result[0] = granted
+        auth_event.set()
+
+    Speech.SFSpeechRecognizer.requestAuthorization_(auth_handler)
+    from Foundation import NSRunLoop, NSDate
+    deadline = time.time() + 30
+    while not auth_event.is_set() and time.time() < deadline:
+        NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.5))
+
+    if not auth_result[0]:
+        print("WARNING: [local-asr] Speech recognition authorization was not granted. "
+              "Grant access in System Settings > Privacy & Security > Speech Recognition.",
+              file=sys.stderr)
+        return False
+
+    return True
+
+
+def transcribe_local(audio_path: str, language: str) -> Optional[str]:
+    """Transcribe audio using macOS SFSpeechRecognizer.
+
+    Converts audio to WAV, then uses Apple's on-device speech recognition.
+
+    Args:
+        audio_path: Path to audio file.
+        language: Language/locale code (e.g. 'zh-CN').
+
+    Returns:
+        Recognized text, or None on failure.
+    """
+    wav_path = None
+    try:
+        import Speech  # noqa: N811 — pyobjc framework naming
+        import Foundation
+    except ImportError:
+        print("WARNING: [local-asr] pyobjc-framework-Speech not installed. "
+              "Install with: pip install pyobjc-framework-Speech", file=sys.stderr)
+        return None
+
+    try:
+        # Ensure we have speech recognition authorization
+        if not _ensure_speech_authorization():
+            return None
+
+        # Convert to WAV (keep original sample rate for better quality)
+        wav_path = convert_audio_to_wav(audio_path)
+
+        # Normalize language code: SFSpeechRecognizer expects locale like "zh-CN", "en-US"
+        locale_str = language.replace("_", "-")
+        locale = Foundation.NSLocale.alloc().initWithLocaleIdentifier_(locale_str)
+        recognizer = Speech.SFSpeechRecognizer.alloc().initWithLocale_(locale)
+
+        if not recognizer or not recognizer.isAvailable():
+            print(f"WARNING: [local-asr] SFSpeechRecognizer not available for locale '{locale_str}'",
+                  file=sys.stderr)
+            return None
+
+        url = Foundation.NSURL.fileURLWithPath_(wav_path)
+        request = Speech.SFSpeechURLRecognitionRequest.alloc().initWithURL_(url)
+
+        # Force on-device recognition if supported
+        if recognizer.supportsOnDeviceRecognition():
+            request.setRequiresOnDeviceRecognition_(True)
+
+        # Use threading.Event for synchronous wait
+        result_text = [None]  # Use list for closure mutability
+        best_partial = [None]  # Track best intermediate result as fallback
+        error_msg = [None]
+        event = threading.Event()
+
+        def handler(result, error):
+            if error:
+                error_msg[0] = str(error)
+                event.set()
+                return
+            if result:
+                text = result.bestTranscription().formattedString()
+                if text:
+                    best_partial[0] = text
+                if result.isFinal():
+                    result_text[0] = text
+                    event.set()
+
+        recognizer.recognitionTaskWithRequest_resultHandler_(request, handler)
+
+        # Wait up to 120 seconds — pump NSRunLoop so ObjC callbacks fire
+        from Foundation import NSRunLoop, NSDate
+        deadline = time.time() + 120
+        while not event.is_set() and time.time() < deadline:
+            NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.5))
+        if not event.is_set():
+            print("WARNING: [local-asr] Recognition timed out (>120s)", file=sys.stderr)
+            return None
+
+        if error_msg[0]:
+            print(f"WARNING: [local-asr] Recognition error: {error_msg[0]}", file=sys.stderr)
+            return None
+
+        # Workaround: macOS SFSpeechRecognizer sometimes returns empty text in
+        # the isFinal callback despite producing valid intermediate results.
+        # Fall back to the best intermediate transcription in that case.
+        final = result_text[0]
+        if not final and best_partial[0]:
+            print("WARNING: [local-asr] Final result was empty, using best intermediate result",
+                  file=sys.stderr)
+            return best_partial[0]
+        return final
+
+    except RuntimeError as e:
+        print(f"WARNING: [local-asr] Audio conversion failed: {e}", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"WARNING: [local-asr] Unexpected error: {e}", file=sys.stderr)
+        return None
+    finally:
+        if wav_path:
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
+
+
 # ── Merge forward resolution ────────────────────────────────────────
 
 def _get_sub_messages_via_get_api(client, message_id: str) -> list[dict]:
@@ -594,6 +912,61 @@ def cmd_download_media(args):
     print(json.dumps({"path": path, "filename": filename, "size": len(data)}, indent=2))
 
 
+def cmd_transcribe(args):
+    """Transcribe an audio file to text using ASR."""
+    audio_path = args.audio_file
+
+    # Validate input file
+    if not os.path.isfile(audio_path):
+        print(f"ERROR: Audio file not found: {audio_path}", file=sys.stderr)
+        sys.exit(1)
+
+    engine = args.engine
+    language = args.language
+    app_name = args.app
+
+    start_time = time.time()
+    text = None
+    used_engine = None
+
+    if engine in ("auto", "feishu"):
+        print(f"INFO: Trying Feishu ASR (language={language})...", file=sys.stderr)
+        text = transcribe_feishu(audio_path, app_name, language)
+        if text is not None:
+            used_engine = "feishu"
+        elif engine == "feishu":
+            # Feishu-only mode, no fallback
+            print("ERROR: Feishu ASR failed and no fallback allowed (--engine feishu)", file=sys.stderr)
+            sys.exit(1)
+        else:
+            print("INFO: Feishu ASR failed, falling back to local macOS ASR...", file=sys.stderr)
+
+    if text is None and engine in ("auto", "local"):
+        print(f"INFO: Trying local macOS ASR (language={language})...", file=sys.stderr)
+        text = transcribe_local(audio_path, language)
+        if text is not None:
+            used_engine = "local"
+        else:
+            print("ERROR: Local macOS ASR also failed", file=sys.stderr)
+            sys.exit(1)
+
+    if text is None:
+        print("ERROR: All ASR engines failed", file=sys.stderr)
+        sys.exit(1)
+
+    duration_ms = int((time.time() - start_time) * 1000)
+
+    if not text:
+        print("WARNING: Recognition returned empty text", file=sys.stderr)
+
+    output = {
+        "text": text or "",
+        "engine": used_engine,
+        "duration_ms": duration_ms,
+    }
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+
+
 # ── Main ─────────────────────────────────────────────────────────────
 
 def main():
@@ -621,6 +994,15 @@ def main():
     p_dl.add_argument("--type", default="image", choices=["image", "file", "audio", "media"],
                       help="Resource type (default: image)")
 
+    # transcribe
+    p_asr = subparsers.add_parser("transcribe",
+                                  help="Transcribe audio file to text (speech-to-text)")
+    p_asr.add_argument("audio_file", help="Path to audio file (opus, wav, m4a, etc.)")
+    p_asr.add_argument("--engine", default="auto", choices=["auto", "feishu", "local"],
+                       help="ASR engine: auto (feishu→local fallback), feishu, or local (default: auto)")
+    p_asr.add_argument("--language", default="zh-CN",
+                       help="Language/locale code (default: zh-CN)")
+
     args = parser.parse_args()
 
     if args.command == "get-message":
@@ -629,6 +1011,8 @@ def main():
         cmd_parse_forward(args)
     elif args.command == "download-media":
         cmd_download_media(args)
+    elif args.command == "transcribe":
+        cmd_transcribe(args)
     else:
         parser.print_help()
         sys.exit(1)
