@@ -213,4 +213,4 @@ python3 scripts/asr.py --file-path /path/to/audio.opus --duration 5000
 
 ### 引擎降级
 
-脚本内部自动降级：飞书 ASR → macOS 本地 ASR。降级对 gateway 透明。
+脚本内部自动降级：飞书 ASR → macOS 本地 ASR。降级对 gateway 透明。降级时会输出 WARNING 日志并附上音频文件路径，便于排查。

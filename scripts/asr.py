@@ -92,7 +92,7 @@ def do_recognize(file_path: str, duration_ms: int) -> None:
 
     # Engine 2: macOS local fallback
     if not text:
-        print("INFO: [asr] Feishu failed, trying local macOS ASR...", file=sys.stderr)
+        print(f"WARNING: [asr] Feishu ASR returned empty text for {file_path}, falling back to local engine", file=sys.stderr)
         try:
             text = transcribe_local(file_path, language)
             if text:
