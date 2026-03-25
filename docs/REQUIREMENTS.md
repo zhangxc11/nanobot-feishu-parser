@@ -72,7 +72,7 @@ nanobot 通过飞书 webhook 接收消息事件，但 webhook 事件中：
 
 > 详情: [requirements/fr6-asr-plugin-registration.md](requirements/fr6-asr-plugin-registration.md)
 > TODO: a69ac328 | 关联: nanobot §76 (Gateway ASR 插件注册架构)
-> 状态: 需求已对齐，待排期开发
+> 状态: 🚧 开发中
 
 **Summary**: feishu-parser skill 作为 ASR 引擎提供方，按 gateway 插件注册规范注册自身，提供 ASR 脚本供 gateway 调用。
 

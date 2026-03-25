@@ -173,3 +173,44 @@ python3 skills/feishu-parser/scripts/feishu_parser.py transcribe <audio_file_pat
 - `lark-oapi` (已安装)
 - `requests` (已安装)
 - `pyobjc-framework-Speech` (已安装，macOS 本地 ASR fallback 所需)
+
+## ASR 插件接口 (Gateway 集成)
+
+> 关联: nanobot §76 (Gateway ASR 插件注册架构)
+
+feishu-parser 作为 ASR 引擎提供方，通过 `scripts/asr.py` 向 nanobot gateway 注册自身。Gateway 启动时自动扫描 `~/.nanobot/plugins/asr/` 目录加载插件，收到语音消息时 subprocess 调用脚本进行识别。
+
+### 注册
+
+```bash
+python3 skills/feishu-parser/scripts/asr.py --register
+```
+
+写入 `~/.nanobot/plugins/asr/feishu-asr.json`，包含脚本路径、参数规范、超时配置。
+
+### 调用接口
+
+```bash
+python3 scripts/asr.py --file-path /path/to/audio.opus --duration 5000
+```
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `--file-path` | str | 本地音频文件路径 |
+| `--duration` | int | 音频时长（毫秒） |
+
+### 输出
+
+**成功** (exit 0):
+```json
+{"recognition": "识别出的文本", "engine": "feishu", "duration_ms": 3200}
+```
+
+**失败** (exit 1):
+```json
+{"error": "错误描述", "engine": "feishu"}
+```
+
+### 引擎降级
+
+脚本内部自动降级：飞书 ASR → macOS 本地 ASR。降级对 gateway 透明。
